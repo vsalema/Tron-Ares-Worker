@@ -1,0 +1,27 @@
+/* webtor-torrents-ui.css */
+#torrentList { padding: 10px 8px 14px; }
+
+.tor-toolbar { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin: 6px 0 10px; }
+.tor-input {
+  flex: 1 1 320px; min-width: 240px;
+  padding: 10px 12px; border-radius: 12px;
+  border: 1px solid rgba(127,127,127,.45);
+  background: rgba(0,0,0,.12); color: inherit;
+}
+.tor-btn {
+  padding: 10px 14px; border-radius: 12px;
+  border: 1px solid rgba(127,127,127,.45);
+  background: transparent; color: inherit;
+  cursor: pointer; font-weight: 700;
+}
+.tor-btn.danger { border-color: rgba(255,90,90,.55); }
+.tor-hint { opacity:.85; font-size:13px; margin: 4px 0 10px; }
+.tor-list { display:flex; flex-direction:column; gap:10px; }
+.tor-item {
+  display:flex; gap:10px; align-items:center; justify-content:space-between;
+  padding: 12px; border-radius: 14px;
+  border: 1px solid rgba(127,127,127,.35);
+  background: rgba(0,0,0,.16);
+}
+.tor-meta { min-width:0; flex:1; }
+.tor-actions { display:flex; gap:8px; flex-wrap:wrap; }
