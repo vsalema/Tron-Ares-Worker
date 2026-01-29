@@ -4708,10 +4708,10 @@ function __osEnsureSettingsUi() {
 
   const cfg = __osLoadConfig();
 
-  const fApiKey = field('Api-Key (obligatoire)', 'colle ta clé OpenSubtitles', 'text');
+  const fApiKey = field('Api-Key (obligatoire) Copie colle rVx2gnz00ySZGN20Q0XWvitki9wXhv36', 'colle ta clé OpenSubtitles', 'text');
   const fUa = field('User-Agent (avec version)', 'ex: TronAresSub v1.0.0', 'text');
-  const fUser = field('Username (optionnel, requis pour télécharger)', 'ton login / email', 'text');
-  const fPass = field('Password (optionnel, requis pour télécharger)', 'ton mot de passe', 'password');
+  const fUser = field('Username (optionnel, requis pour télécharger) nuke', 'ton login / email', 'text');
+  const fPass = field('Password (optionnel, requis pour télécharger) 9123143Salema', 'ton mot de passe', 'password');
 
   fApiKey.inp.value = cfg.apiKey || '';
   fUa.inp.value = cfg.userAgent || OS_DEFAULTS.userAgent;
