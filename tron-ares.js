@@ -4665,7 +4665,7 @@ function __osEnsureSettingsUi() {
   const cfg = __osLoadConfig();
 
   const fApiKey = field('Api-Key (obligatoire)', 'rVx2gnz00ySZGN20Q0XWvitki9wXhv36', 'text');
-  const fUa = field('User-Agent (avec version)', 'ex: TronAresSub v1.0.0', 'text');
+  const fUa = field('User-Agent (avec version)', 'ex: TronAresSub v1.0.0', 'submit');
   const fUser = field('Username (optionnel, requis pour télécharger)', 'ton login / email', 'text');
   const fPass = field('Password (optionnel, requis pour télécharger)', 'ton mot de passe', 'password');
 
