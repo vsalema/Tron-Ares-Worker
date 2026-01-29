@@ -4543,7 +4543,7 @@ async function __osSearchSubtitles(query, languages, entry) {
   return json;
 }
 
-async function __osDownloadSubtitleFileText(fileId, subFormat = 'srt') {
+async function __osGetDownloadLink(fileId, subFormat = 'srt') {
   const cfg = __osLoadConfig();
   if (!cfg.apiKey) throw new Error('Api-Key manquante. Ouvre les réglages (⚙).');
 
@@ -4561,17 +4561,24 @@ async function __osDownloadSubtitleFileText(fileId, subFormat = 'srt') {
   if (!res.ok || !json || !json.link) {
     const ct = (res.headers.get('content-type') || '').toLowerCase();
     if (ct.includes('text/html')) {
-      throw new Error('OpenSubtitles a refusé la requête (' + res.status + '). Si tu vois "Access denied / Varnish", c’est un blocage anti-proxy.');
+      throw new Error('OpenSubtitles a refusé la requête (' + res.status + '). Si tu vois "Access denied / Varnish", c’est un blocage réseau côté OpenSubtitles.');
     }
     const msg = (json && (json.message || json.error)) ? (json.message || json.error) : txt;
     throw new Error('OpenSubtitles download (' + res.status + '): ' + (msg || ''));
   }
 
-  // 2) télécharger le fichier via le lien
-  const fileRes = await fetch(String(json.link), { method: 'GET' });
+  return { link: String(json.link), fileName: (json.file_name ? String(json.file_name) : ''), raw: json };
+}
+
+async function __osDownloadSubtitleFileText(fileId, subFormat = 'srt') {
+  // ⚠️ Best-effort : selon le domaine du lien, le navigateur peut refuser la lecture (CORS).
+  const { link } = await __osGetDownloadLink(fileId, subFormat);
+
+  const fileRes = await fetch(link, { method: 'GET' });
   if (!fileRes.ok) throw new Error('Téléchargement fichier (' + fileRes.status + ')');
   return await fileRes.text();
 }
+
 
 // -----------------------------------------------------
 // UI Réglages OpenSubtitles (injectée dans le popup)
@@ -4664,7 +4671,7 @@ function __osEnsureSettingsUi() {
 
   const cfg = __osLoadConfig();
 
-  const fApiKey = field('Copie colle (rVx2gnz00ySZGN20Q0XWvitki9wXhv36)', '', 'text');
+  const fApiKey = field('Api-Key (obligatoire)', 'colle ta clé OpenSubtitles', 'text');
   const fUa = field('User-Agent (avec version)', 'ex: TronAresSub v1.0.0', 'text');
   const fUser = field('Username (optionnel, requis pour télécharger)', 'ton login / email', 'text');
   const fPass = field('Password (optionnel, requis pour télécharger)', 'ton mot de passe', 'password');
@@ -4905,6 +4912,39 @@ function __subtitleAddTrackFromVttText(vttText, label = 'Sous-titres', lang = 'u
   }, 50);
 }
 
+function __subtitleAddTrackFromUrl(vttUrl, label = 'Sous-titres', lang = 'und') {
+  if (!videoEl) return;
+
+  // Aide CORS pour les pistes externes
+  try { if (!videoEl.getAttribute('crossorigin')) videoEl.setAttribute('crossorigin', 'anonymous'); } catch {}
+
+  __subtitleDisableAllTextTracks();
+  __subtitleRemoveAllExternalTracks();
+
+  const track = document.createElement('track');
+  track.kind = 'subtitles';
+  track.label = label || 'Sous-titres';
+  track.srclang = (lang || 'und');
+  track.src = String(vttUrl);
+  track.default = true;
+
+  videoEl.appendChild(track);
+  __externalSubtitleTrackEls.push(track);
+
+  setTimeout(() => {
+    try {
+      const tt = Array.from(videoEl.textTracks || []);
+      tt.forEach(t => {
+        if ((t.kind === 'subtitles' || t.kind === 'captions') && (t.label === track.label || t.language === track.srclang)) {
+          t.mode = 'showing';
+        }
+      });
+    } catch {}
+    try { refreshTrackMenus(); } catch {}
+  }, 50);
+}
+
+
 function __subtitleSrtToVtt(srt) {
   // Conversion simple SRT -> VTT (assez robuste pour 95% des fichiers)
   let out = String(srt || '').replace(/\r+/g, '');
@@ -4952,6 +4992,11 @@ async function __subtitleProxySearchOpenSubtitles(query, languagesCsv, entry) {
 async function __subtitleProxyDownloadFileOpenSubtitles(fileId, format = 'srt') {
   // Appel DIRECT OpenSubtitles (navigateur) + login si nécessaire
   return await __osDownloadSubtitleFileText(fileId, format);
+}
+
+async function __subtitleProxyGetDownloadLinkOpenSubtitles(fileId, format = 'srt') {
+  // Demande un lien de téléchargement (pas besoin de lire le fichier, évite les soucis CORS)
+  return await __osGetDownloadLink(fileId, format);
 }
 
 function __subtitleRenderResultsOpenSubtitles(data, languagesCsv) {
@@ -5017,14 +5062,37 @@ function __subtitleRenderResultsOpenSubtitles(data, languagesCsv) {
     applyBtn.addEventListener('click', async () => {
       if (!fileId) return;
       try {
-        __subtitleSetStatus('Téléchargement…');
-        const srtText = await __subtitleProxyDownloadFileOpenSubtitles(fileId, 'srt');
-        const vtt = __subtitleSrtToVtt(srtText);
-        __subtitleAddTrackFromVttText(vtt, (lang ? ('OS ' + lang) : 'OpenSubtitles'), (lang || 'und'));
+        __subtitleSetStatus('Application…');
+
+        // On demande directement un VTT et on l’applique via <track src="..."> (évite les problèmes CORS de fetch())
+        const { link } = await __subtitleProxyGetDownloadLinkOpenSubtitles(fileId, 'vtt');
+
+        if (!videoEl) {
+          // Si la page ne contrôle pas le player, on ouvre le lien et on laisse importer manuellement
+          try { window.open(link, '_blank', 'noopener'); } catch {}
+          __subtitleSetStatus('Lien VTT ouvert. Importe le fichier dans le lecteur si besoin.');
+          return;
+        }
+
+        __subtitleAddTrackFromUrl(link, (lang ? ('OS ' + lang) : 'OpenSubtitles'), (lang || 'und'));
         __subtitleSetStatus('Sous-titres appliqués.');
         __subtitleCloseOverlay();
       } catch (e) {
         console.error(e);
+
+        // Fallback: tenter l’ancienne méthode (lecture du fichier + conversion) si le VTT n’est pas dispo
+        try {
+          __subtitleSetStatus('Fallback…');
+          const srtText = await __subtitleProxyDownloadFileOpenSubtitles(fileId, 'srt');
+          const vtt = __subtitleSrtToVtt(srtText);
+          if (videoEl) {
+            __subtitleAddTrackFromVttText(vtt, (lang ? ('OS ' + lang) : 'OpenSubtitles'), (lang || 'und'));
+            __subtitleSetStatus('Sous-titres appliqués.');
+            __subtitleCloseOverlay();
+            return;
+          }
+        } catch {}
+
         __subtitleSetStatus('Erreur: ' + (e && e.message ? e.message : String(e)));
       }
     });
@@ -5038,17 +5106,21 @@ function __subtitleRenderResultsOpenSubtitles(data, languagesCsv) {
     dlBtn.addEventListener('click', async () => {
       if (!fileId) return;
       try {
-        __subtitleSetStatus('Téléchargement…');
-        const srtText = await __subtitleProxyDownloadFileOpenSubtitles(fileId, 'srt');
-        const blob = new Blob([srtText], { type: 'application/x-subrip;charset=utf-8' });
-        const url = URL.createObjectURL(blob);
+        __subtitleSetStatus('Préparation…');
+
+        const { link } = await __subtitleProxyGetDownloadLinkOpenSubtitles(fileId, 'srt');
+
+        // Déclenche le téléchargement directement via le lien (pas de fetch => pas de CORS)
         const a = document.createElement('a');
-        a.href = url;
+        a.href = link;
+        a.target = '_blank';
+        a.rel = 'noopener';
+        // "download" peut être ignoré en cross-origin, mais ne gêne pas
         a.download = fileName || ('subtitle-' + fileId + '.srt');
         document.body.appendChild(a);
         a.click();
         a.remove();
-        setTimeout(() => { try { URL.revokeObjectURL(url); } catch {} }, 1500);
+
         __subtitleSetStatus('Téléchargement lancé.');
       } catch (e) {
         console.error(e);
