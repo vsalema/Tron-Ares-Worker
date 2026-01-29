@@ -4446,6 +4446,9 @@ function __osClearToken() {
   try { localStorage.removeItem(OS_TOKEN_KEY); } catch {}
 }
 
+let __osLoginInFlight = null;
+let __osLoginCooldownUntil = 0;
+
 function __osHeaders(cfg, extra = {}) {
   const h = new Headers(extra || {});
   h.set('Accept', 'application/json');
@@ -4468,17 +4471,27 @@ async function __osFetch(cfg, path, init = {}, requireAuth = false) {
   const headers = __osHeaders(cfg, init.headers || {});
   const reqInit = { ...init, headers };
 
+  // Auth: ajoute Bearer token, et retente 1 fois si token expiré (401)
   if (requireAuth) {
-    const tok = __osLoadToken();
-    if (tok && tok.token) {
-      headers.set('Authorization', `Bearer ${tok.token}`);
-    } else {
+    let tok = __osLoadToken();
+    if (!tok || !tok.token) {
       const token = await __osLogin(cfg);
-      headers.set('Authorization', `Bearer ${token}`);
+      tok = { token };
     }
+    headers.set('Authorization', `Bearer ${tok.token}`);
   }
 
-  return await fetch(url, reqInit);
+  let res = await fetch(url, reqInit);
+
+  if (requireAuth && res && res.status === 401) {
+    // Token probablement expiré: on purge et on relogin (une seule fois)
+    __osClearToken();
+    const token = await __osLogin(cfg);
+    headers.set('Authorization', `Bearer ${token}`);
+    res = await fetch(url, reqInit);
+  }
+
+  return res;
 }
 
 async function __osLogin(cfg) {
@@ -4488,28 +4501,59 @@ async function __osLogin(cfg) {
     throw new Error('Login requis pour télécharger. Renseigne username/password dans les réglages (⚙).');
   }
 
+  // Si on a déjà un token valide, on l'utilise.
   const existing = __osLoadToken();
   if (existing && existing.token) return existing.token;
 
-  const res = await __osFetch(cfg, '/login', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username, password }),
-  }, false);
+  // Anti-spam: si un login est déjà en cours, on attend le même.
+  if (__osLoginInFlight) return __osLoginInFlight;
 
-  const txt = await res.text().catch(() => '');
-  let json;
-  try { json = JSON.parse(txt); } catch { json = null; }
+  const doLogin = async () => {
+    // Cooldown si on a pris un 429 juste avant
+    const now = Date.now();
+    if (now < __osLoginCooldownUntil) {
+      await new Promise(r => setTimeout(r, __osLoginCooldownUntil - now));
+    }
 
-  if (!res.ok || !json || !json.token) {
-    const msg = (json && (json.message || json.error)) ? (json.message || json.error) : txt;
-    throw new Error('Échec login OpenSubtitles (' + res.status + '): ' + (msg || ''));
-  }
+    // Re-check (au cas où un autre login vient de remplir le token)
+    const again = __osLoadToken();
+    if (again && again.token) return again.token;
 
-  __osSaveToken(String(json.token), 10 * 60_000);
-  return String(json.token);
+    // 2 tentatives max (si 429, on attend ~1s puis on retente)
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const res = await __osFetch(cfg, '/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password }),
+      }, false);
+
+      const txt = await res.text().catch(() => '');
+      let json = null;
+      try { json = JSON.parse(txt); } catch {}
+
+      if (res.ok && json && json.token) {
+        // Garde le token 1 heure pour éviter de relogin trop souvent
+        __osSaveToken(String(json.token), 60 * 60_000);
+        return String(json.token);
+      }
+
+      if (res.status === 429) {
+        // OpenSubtitles: 1 req/sec par IP sur /login
+        __osLoginCooldownUntil = Date.now() + 1100;
+        if (attempt === 0) continue;
+        throw new Error('Échec login OpenSubtitles (429): Login rate limit exceeded: 1 req/sec per IP. Attends 1 seconde puis réessaie.');
+      }
+
+      const msg = (json && (json.message || json.error)) ? (json.message || json.error) : txt;
+      throw new Error('Échec login OpenSubtitles (' + res.status + '): ' + (msg || ''));
+    }
+
+    throw new Error('Échec login OpenSubtitles: impossible de se connecter.');
+  };
+
+  __osLoginInFlight = doLogin().finally(() => { __osLoginInFlight = null; });
+  return __osLoginInFlight;
 }
-
 async function __osSearchSubtitles(query, languages, entry) {
   const cfg = __osLoadConfig();
   if (!cfg.apiKey) throw new Error('Api-Key manquante. Ouvre les réglages (⚙).');
@@ -4543,7 +4587,7 @@ async function __osSearchSubtitles(query, languages, entry) {
   return json;
 }
 
-async function __osGetDownloadLink(fileId, subFormat = 'srt') {
+async function __osDownloadSubtitleFileText(fileId, subFormat = 'srt') {
   const cfg = __osLoadConfig();
   if (!cfg.apiKey) throw new Error('Api-Key manquante. Ouvre les réglages (⚙).');
 
@@ -4561,24 +4605,17 @@ async function __osGetDownloadLink(fileId, subFormat = 'srt') {
   if (!res.ok || !json || !json.link) {
     const ct = (res.headers.get('content-type') || '').toLowerCase();
     if (ct.includes('text/html')) {
-      throw new Error('OpenSubtitles a refusé la requête (' + res.status + '). Si tu vois "Access denied / Varnish", c’est un blocage réseau côté OpenSubtitles.');
+      throw new Error('OpenSubtitles a refusé la requête (' + res.status + '). Si tu vois "Access denied / Varnish", c’est un blocage anti-proxy.');
     }
     const msg = (json && (json.message || json.error)) ? (json.message || json.error) : txt;
     throw new Error('OpenSubtitles download (' + res.status + '): ' + (msg || ''));
   }
 
-  return { link: String(json.link), fileName: (json.file_name ? String(json.file_name) : ''), raw: json };
-}
-
-async function __osDownloadSubtitleFileText(fileId, subFormat = 'srt') {
-  // ⚠️ Best-effort : selon le domaine du lien, le navigateur peut refuser la lecture (CORS).
-  const { link } = await __osGetDownloadLink(fileId, subFormat);
-
-  const fileRes = await fetch(link, { method: 'GET' });
+  // 2) télécharger le fichier via le lien
+  const fileRes = await fetch(String(json.link), { method: 'GET' });
   if (!fileRes.ok) throw new Error('Téléchargement fichier (' + fileRes.status + ')');
   return await fileRes.text();
 }
-
 
 // -----------------------------------------------------
 // UI Réglages OpenSubtitles (injectée dans le popup)
@@ -4912,39 +4949,6 @@ function __subtitleAddTrackFromVttText(vttText, label = 'Sous-titres', lang = 'u
   }, 50);
 }
 
-function __subtitleAddTrackFromUrl(vttUrl, label = 'Sous-titres', lang = 'und') {
-  if (!videoEl) return;
-
-  // Aide CORS pour les pistes externes
-  try { if (!videoEl.getAttribute('crossorigin')) videoEl.setAttribute('crossorigin', 'anonymous'); } catch {}
-
-  __subtitleDisableAllTextTracks();
-  __subtitleRemoveAllExternalTracks();
-
-  const track = document.createElement('track');
-  track.kind = 'subtitles';
-  track.label = label || 'Sous-titres';
-  track.srclang = (lang || 'und');
-  track.src = String(vttUrl);
-  track.default = true;
-
-  videoEl.appendChild(track);
-  __externalSubtitleTrackEls.push(track);
-
-  setTimeout(() => {
-    try {
-      const tt = Array.from(videoEl.textTracks || []);
-      tt.forEach(t => {
-        if ((t.kind === 'subtitles' || t.kind === 'captions') && (t.label === track.label || t.language === track.srclang)) {
-          t.mode = 'showing';
-        }
-      });
-    } catch {}
-    try { refreshTrackMenus(); } catch {}
-  }, 50);
-}
-
-
 function __subtitleSrtToVtt(srt) {
   // Conversion simple SRT -> VTT (assez robuste pour 95% des fichiers)
   let out = String(srt || '').replace(/\r+/g, '');
@@ -4992,11 +4996,6 @@ async function __subtitleProxySearchOpenSubtitles(query, languagesCsv, entry) {
 async function __subtitleProxyDownloadFileOpenSubtitles(fileId, format = 'srt') {
   // Appel DIRECT OpenSubtitles (navigateur) + login si nécessaire
   return await __osDownloadSubtitleFileText(fileId, format);
-}
-
-async function __subtitleProxyGetDownloadLinkOpenSubtitles(fileId, format = 'srt') {
-  // Demande un lien de téléchargement (pas besoin de lire le fichier, évite les soucis CORS)
-  return await __osGetDownloadLink(fileId, format);
 }
 
 function __subtitleRenderResultsOpenSubtitles(data, languagesCsv) {
@@ -5062,37 +5061,14 @@ function __subtitleRenderResultsOpenSubtitles(data, languagesCsv) {
     applyBtn.addEventListener('click', async () => {
       if (!fileId) return;
       try {
-        __subtitleSetStatus('Application…');
-
-        // On demande directement un VTT et on l’applique via <track src="..."> (évite les problèmes CORS de fetch())
-        const { link } = await __subtitleProxyGetDownloadLinkOpenSubtitles(fileId, 'vtt');
-
-        if (!videoEl) {
-          // Si la page ne contrôle pas le player, on ouvre le lien et on laisse importer manuellement
-          try { window.open(link, '_blank', 'noopener'); } catch {}
-          __subtitleSetStatus('Lien VTT ouvert. Importe le fichier dans le lecteur si besoin.');
-          return;
-        }
-
-        __subtitleAddTrackFromUrl(link, (lang ? ('OS ' + lang) : 'OpenSubtitles'), (lang || 'und'));
+        __subtitleSetStatus('Téléchargement…');
+        const srtText = await __subtitleProxyDownloadFileOpenSubtitles(fileId, 'srt');
+        const vtt = __subtitleSrtToVtt(srtText);
+        __subtitleAddTrackFromVttText(vtt, (lang ? ('OS ' + lang) : 'OpenSubtitles'), (lang || 'und'));
         __subtitleSetStatus('Sous-titres appliqués.');
         __subtitleCloseOverlay();
       } catch (e) {
         console.error(e);
-
-        // Fallback: tenter l’ancienne méthode (lecture du fichier + conversion) si le VTT n’est pas dispo
-        try {
-          __subtitleSetStatus('Fallback…');
-          const srtText = await __subtitleProxyDownloadFileOpenSubtitles(fileId, 'srt');
-          const vtt = __subtitleSrtToVtt(srtText);
-          if (videoEl) {
-            __subtitleAddTrackFromVttText(vtt, (lang ? ('OS ' + lang) : 'OpenSubtitles'), (lang || 'und'));
-            __subtitleSetStatus('Sous-titres appliqués.');
-            __subtitleCloseOverlay();
-            return;
-          }
-        } catch {}
-
         __subtitleSetStatus('Erreur: ' + (e && e.message ? e.message : String(e)));
       }
     });
@@ -5106,21 +5082,17 @@ function __subtitleRenderResultsOpenSubtitles(data, languagesCsv) {
     dlBtn.addEventListener('click', async () => {
       if (!fileId) return;
       try {
-        __subtitleSetStatus('Préparation…');
-
-        const { link } = await __subtitleProxyGetDownloadLinkOpenSubtitles(fileId, 'srt');
-
-        // Déclenche le téléchargement directement via le lien (pas de fetch => pas de CORS)
+        __subtitleSetStatus('Téléchargement…');
+        const srtText = await __subtitleProxyDownloadFileOpenSubtitles(fileId, 'srt');
+        const blob = new Blob([srtText], { type: 'application/x-subrip;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
-        a.href = link;
-        a.target = '_blank';
-        a.rel = 'noopener';
-        // "download" peut être ignoré en cross-origin, mais ne gêne pas
+        a.href = url;
         a.download = fileName || ('subtitle-' + fileId + '.srt');
         document.body.appendChild(a);
         a.click();
         a.remove();
-
+        setTimeout(() => { try { URL.revokeObjectURL(url); } catch {} }, 1500);
         __subtitleSetStatus('Téléchargement lancé.');
       } catch (e) {
         console.error(e);
