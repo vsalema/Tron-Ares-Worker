@@ -4380,7 +4380,7 @@ document.addEventListener('click', () => closeAllTrackMenus());
 // - GitHub Pages = site statique : tu ne peux pas appeler OpenSubtitles directement depuis le navigateur (CORS).
 // - Donc on passe par un petit proxy (Cloudflare Worker / Netlify Function) qui ajoute les headers et CORS.
 // Mets ici l'URL de ton proxy (ex: https://subproxy.example.workers.dev)
-const SUBTITLE_PROXY_BASE = 'https://subproxy-opensub2.victor-salema-53d.workers.dev/'; // <- À REMPLIR
+const SUBTITLE_PROXY_BASE = ''; // <- À REMPLIR
 
 // Track elements ajoutés dynamiquement (pour pouvoir les nettoyer)
 const __externalSubtitleTrackEls = [];
@@ -4586,7 +4586,7 @@ async function __subtitleProxyDownloadFileOpenSubtitles(fileId, format = 'srt') 
   }
   const u = new URL(SUBTITLE_PROXY_BASE.replace(/\/+$/,'') + '/download-file');
   u.searchParams.set('file_id', String(fileId));
-  u.searchParams.set('format', format);
+  u.searchParams.set('sub_format', format);
 
   const res = await fetch(u.toString(), { method: 'GET' });
   if (!res.ok) throw new Error('Erreur téléchargement (' + res.status + ')');
