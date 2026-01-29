@@ -4375,12 +4375,391 @@ document.addEventListener('click', () => closeAllTrackMenus());
 // =====================================================
 // SOUS-TITRES EXTERNES (import local + recherche en ligne)
 // =====================================================
+//
+// ✅ Mode DIRECT (sans proxy):
+// - On appelle OpenSubtitles depuis le navigateur.
+// - Ça évite le 403 "Varnish / Access denied" qui peut arriver quand les requêtes viennent d’un proxy (Worker).
+//
+// Pré-requis OpenSubtitles:
+// - Header "Api-Key" obligatoire
+// - "User-Agent" (et/ou "X-User-Agent") doit contenir une VERSION, ex: "TronAresSub v1.0.0"
+//
+// Recherche: OK sans login
+// Téléchargement SRT: nécessite login (username/password) pour obtenir un token.
+//
+// -----------------------------------------------------
 
-// 1) IMPORTANT:
-// - GitHub Pages = site statique : tu ne peux pas appeler OpenSubtitles directement depuis le navigateur (CORS).
-// - Donc on passe par un petit proxy (Cloudflare Worker / Netlify Function) qui ajoute les headers et CORS.
-// Mets ici l'URL de ton proxy (ex: https://subproxy.example.workers.dev)
-const SUBTITLE_PROXY_BASE = 'https://subproxy-opensub2.victor-salema-53d.workers.dev'; // <- À REMPLIR
+const OS_DEFAULTS = {
+  apiBase: 'https://api.opensubtitles.com/api/v1',
+  userAgent: 'TronAresSub v1.0.0',
+  apiKey: '',
+  username: '',
+  password: '',
+};
+
+const OS_STORAGE_KEY = 'tronAres.opensub.config.v1';
+const OS_TOKEN_KEY = 'tronAres.opensub.token.v1';
+
+function __osLoadConfig() {
+  try {
+    const raw = localStorage.getItem(OS_STORAGE_KEY);
+    if (!raw) return { ...OS_DEFAULTS };
+    const parsed = JSON.parse(raw);
+    return { ...OS_DEFAULTS, ...(parsed || {}) };
+  } catch {
+    return { ...OS_DEFAULTS };
+  }
+}
+
+function __osSaveConfig(cfg) {
+  const safe = {
+    apiBase: (cfg.apiBase || OS_DEFAULTS.apiBase).trim(),
+    userAgent: (cfg.userAgent || OS_DEFAULTS.userAgent).trim(),
+    apiKey: (cfg.apiKey || '').trim(),
+    username: (cfg.username || '').trim(),
+    password: (cfg.password || ''),
+  };
+  localStorage.setItem(OS_STORAGE_KEY, JSON.stringify(safe));
+  return safe;
+}
+
+function __osLoadToken() {
+  try {
+    const raw = localStorage.getItem(OS_TOKEN_KEY);
+    if (!raw) return null;
+    const t = JSON.parse(raw);
+    if (!t || !t.token || !t.expMs) return null;
+    if (Date.now() >= Number(t.expMs)) return null;
+    return t;
+  } catch {
+    return null;
+  }
+}
+
+function __osSaveToken(token, ttlMs = 10 * 60_000) {
+  const t = { token, expMs: Date.now() + ttlMs };
+  localStorage.setItem(OS_TOKEN_KEY, JSON.stringify(t));
+  return t;
+}
+
+function __osClearToken() {
+  try { localStorage.removeItem(OS_TOKEN_KEY); } catch {}
+}
+
+function __osHeaders(cfg, extra = {}) {
+  const h = new Headers(extra || {});
+  h.set('Accept', 'application/json');
+
+  const apiKey = (cfg.apiKey || '').trim();
+  if (apiKey) h.set('Api-Key', apiKey);
+
+  const ua = (cfg.userAgent || OS_DEFAULTS.userAgent).trim();
+  if (ua) {
+    h.set('User-Agent', ua);
+    h.set('X-User-Agent', ua);
+  }
+  return h;
+}
+
+async function __osFetch(cfg, path, init = {}, requireAuth = false) {
+  const base = (cfg.apiBase || OS_DEFAULTS.apiBase).replace(/\/+$/, '');
+  const url = base + (path.startsWith('/') ? path : ('/' + path));
+
+  const headers = __osHeaders(cfg, init.headers || {});
+  const reqInit = { ...init, headers };
+
+  if (requireAuth) {
+    const tok = __osLoadToken();
+    if (tok && tok.token) {
+      headers.set('Authorization', `Bearer ${tok.token}`);
+    } else {
+      const token = await __osLogin(cfg);
+      headers.set('Authorization', `Bearer ${token}`);
+    }
+  }
+
+  return await fetch(url, reqInit);
+}
+
+async function __osLogin(cfg) {
+  const username = (cfg.username || '').trim();
+  const password = (cfg.password || '');
+  if (!username || !password) {
+    throw new Error('Login requis pour télécharger. Renseigne username/password dans les réglages (⚙).');
+  }
+
+  const existing = __osLoadToken();
+  if (existing && existing.token) return existing.token;
+
+  const res = await __osFetch(cfg, '/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  }, false);
+
+  const txt = await res.text().catch(() => '');
+  let json;
+  try { json = JSON.parse(txt); } catch { json = null; }
+
+  if (!res.ok || !json || !json.token) {
+    const msg = (json && (json.message || json.error)) ? (json.message || json.error) : txt;
+    throw new Error('Échec login OpenSubtitles (' + res.status + '): ' + (msg || ''));
+  }
+
+  __osSaveToken(String(json.token), 10 * 60_000);
+  return String(json.token);
+}
+
+async function __osSearchSubtitles(query, languages, entry) {
+  const cfg = __osLoadConfig();
+  if (!cfg.apiKey) throw new Error('Api-Key manquante. Ouvre les réglages (⚙).');
+
+  const params = new URLSearchParams();
+  if (query) params.set('query', query);
+  if (languages) params.set('languages', languages);
+  params.set('page', '1');
+
+  if (entry && entry.tmdbId) params.set('tmdb_id', String(entry.tmdbId).trim());
+
+  const res = await __osFetch(cfg, '/subtitles?' + params.toString(), { method: 'GET' }, false);
+
+  const txt = await res.text().catch(() => '');
+  let json;
+  try { json = JSON.parse(txt); } catch { json = { raw: txt }; }
+
+  const osMsg = res.headers.get('X-OpenSubtitles-Message');
+  if (osMsg) json.__osMessage = osMsg;
+
+  if (!res.ok) {
+    // WAF HTML -> message clair
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
+    if (ct.includes('text/html')) {
+      throw new Error('OpenSubtitles a refusé la requête (' + res.status + '). Si tu vois "Access denied / Varnish", c’est un blocage anti-proxy.');
+    }
+    const msg = (json && (json.message || json.error)) ? (json.message || json.error) : (json.raw || '');
+    throw new Error('OpenSubtitles search (' + res.status + '): ' + (msg || ''));
+  }
+
+  return json;
+}
+
+async function __osDownloadSubtitleFileText(fileId, subFormat = 'srt') {
+  const cfg = __osLoadConfig();
+  if (!cfg.apiKey) throw new Error('Api-Key manquante. Ouvre les réglages (⚙).');
+
+  // 1) demander un lien de téléchargement
+  const res = await __osFetch(cfg, '/download', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ file_id: Number(fileId), sub_format: subFormat }),
+  }, true);
+
+  const txt = await res.text().catch(() => '');
+  let json;
+  try { json = JSON.parse(txt); } catch { json = null; }
+
+  if (!res.ok || !json || !json.link) {
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
+    if (ct.includes('text/html')) {
+      throw new Error('OpenSubtitles a refusé la requête (' + res.status + '). Si tu vois "Access denied / Varnish", c’est un blocage anti-proxy.');
+    }
+    const msg = (json && (json.message || json.error)) ? (json.message || json.error) : txt;
+    throw new Error('OpenSubtitles download (' + res.status + '): ' + (msg || ''));
+  }
+
+  // 2) télécharger le fichier via le lien
+  const fileRes = await fetch(String(json.link), { method: 'GET' });
+  if (!fileRes.ok) throw new Error('Téléchargement fichier (' + fileRes.status + ')');
+  return await fileRes.text();
+}
+
+// -----------------------------------------------------
+// UI Réglages OpenSubtitles (injectée dans le popup)
+// -----------------------------------------------------
+
+let __osSettingsUiBuilt = false;
+
+function __osEnsureSettingsUi() {
+  if (__osSettingsUiBuilt) return;
+  __osSettingsUiBuilt = true;
+
+  if (!subtitleSearchOverlay || !subtitleSearchOverlay.querySelector) return;
+
+  const actions = subtitleSearchOverlay.querySelector('.subsearch-actions');
+  if (!actions) return;
+
+  const gear = document.createElement('button');
+  gear.type = 'button';
+  gear.className = 'subsearch-mini-btn';
+  gear.textContent = '⚙';
+  gear.title = 'Réglages OpenSubtitles';
+  actions.appendChild(gear);
+
+  const modal = document.createElement('div');
+  modal.style.position = 'fixed';
+  modal.style.inset = '0';
+  modal.style.background = 'rgba(0,0,0,0.55)';
+  modal.style.display = 'none';
+  modal.style.zIndex = '99999';
+
+  const box = document.createElement('div');
+  box.style.maxWidth = '620px';
+  box.style.margin = '7vh auto';
+  box.style.background = '#0b0f14';
+  box.style.border = '1px solid rgba(255,255,255,0.12)';
+  box.style.borderRadius = '14px';
+  box.style.padding = '18px';
+  box.style.boxShadow = '0 20px 60px rgba(0,0,0,0.45)';
+
+  const title = document.createElement('div');
+  title.style.display = 'flex';
+  title.style.alignItems = 'center';
+  title.style.justifyContent = 'space-between';
+  title.style.gap = '10px';
+
+  const h = document.createElement('div');
+  h.textContent = 'Réglages OpenSubtitles';
+  h.style.fontWeight = '700';
+  h.style.fontSize = '18px';
+
+  const close = document.createElement('button');
+  close.type = 'button';
+  close.className = 'subsearch-mini-btn';
+  close.textContent = '✕';
+
+  title.appendChild(h);
+  title.appendChild(close);
+
+  const form = document.createElement('div');
+  form.style.display = 'grid';
+  form.style.gridTemplateColumns = '1fr';
+  form.style.gap = '10px';
+  form.style.marginTop = '12px';
+
+  function field(labelText, placeholder, type = 'text') {
+    const wrap = document.createElement('div');
+
+    const lab = document.createElement('div');
+    lab.textContent = labelText;
+    lab.style.fontSize = '13px';
+    lab.style.opacity = '0.85';
+    lab.style.marginBottom = '6px';
+
+    const inp = document.createElement('input');
+    inp.type = type;
+    inp.placeholder = placeholder || '';
+    inp.style.width = '100%';
+    inp.style.padding = '10px 12px';
+    inp.style.borderRadius = '10px';
+    inp.style.border = '1px solid rgba(255,255,255,0.14)';
+    inp.style.background = 'rgba(255,255,255,0.06)';
+    inp.style.color = 'white';
+    inp.autocomplete = 'off';
+    inp.spellcheck = false;
+
+    wrap.appendChild(lab);
+    wrap.appendChild(inp);
+    return { wrap, inp };
+  }
+
+  const cfg = __osLoadConfig();
+
+  const fApiKey = field('Api-Key (obligatoire)', 'colle ta clé OpenSubtitles', 'text');
+  const fUa = field('User-Agent (avec version)', 'ex: TronAresSub v1.0.0', 'text');
+  const fUser = field('Username (optionnel, requis pour télécharger)', 'ton login / email', 'text');
+  const fPass = field('Password (optionnel, requis pour télécharger)', 'ton mot de passe', 'password');
+
+  fApiKey.inp.value = cfg.apiKey || '';
+  fUa.inp.value = cfg.userAgent || OS_DEFAULTS.userAgent;
+  fUser.inp.value = cfg.username || '';
+  fPass.inp.value = cfg.password || '';
+
+  const foot = document.createElement('div');
+  foot.style.marginTop = '10px';
+  foot.style.display = 'flex';
+  foot.style.gap = '10px';
+  foot.style.flexWrap = 'wrap';
+  foot.style.alignItems = 'center';
+
+  const saveBtn = document.createElement('button');
+  saveBtn.type = 'button';
+  saveBtn.className = 'subsearch-mini-btn';
+  saveBtn.textContent = 'Enregistrer';
+
+  const testBtn = document.createElement('button');
+  testBtn.type = 'button';
+  testBtn.className = 'subsearch-mini-btn';
+  testBtn.textContent = 'Tester recherche';
+
+  const clearTokBtn = document.createElement('button');
+  clearTokBtn.type = 'button';
+  clearTokBtn.className = 'subsearch-mini-btn';
+  clearTokBtn.textContent = 'Effacer token';
+
+  const hint = document.createElement('div');
+  hint.style.fontSize = '12px';
+  hint.style.opacity = '0.8';
+  hint.style.marginTop = '8px';
+  hint.textContent = 'Recherche sans login. Login requis seulement pour télécharger SRT.';
+
+  foot.appendChild(saveBtn);
+  foot.appendChild(testBtn);
+  foot.appendChild(clearTokBtn);
+
+  form.appendChild(fApiKey.wrap);
+  form.appendChild(fUa.wrap);
+  form.appendChild(fUser.wrap);
+  form.appendChild(fPass.wrap);
+  form.appendChild(foot);
+  form.appendChild(hint);
+
+  box.appendChild(title);
+  box.appendChild(form);
+  modal.appendChild(box);
+  document.body.appendChild(modal);
+
+  function open() { modal.style.display = 'block'; }
+  function closeIt() { modal.style.display = 'none'; }
+
+  close.addEventListener('click', closeIt);
+  modal.addEventListener('click', (e) => { if (e.target === modal) closeIt(); });
+  gear.addEventListener('click', open);
+
+  saveBtn.addEventListener('click', () => {
+    const next = __osSaveConfig({
+      apiBase: OS_DEFAULTS.apiBase,
+      apiKey: fApiKey.inp.value,
+      userAgent: fUa.inp.value,
+      username: fUser.inp.value,
+      password: fPass.inp.value,
+    });
+    __subtitleSetStatus(next.apiKey ? 'Réglages enregistrés.' : 'Réglages enregistrés (Api-Key manquante).');
+    closeIt();
+  });
+
+  testBtn.addEventListener('click', async () => {
+    try {
+      __osSaveConfig({
+        apiBase: OS_DEFAULTS.apiBase,
+        apiKey: fApiKey.inp.value,
+        userAgent: fUa.inp.value,
+        username: fUser.inp.value,
+        password: fPass.inp.value,
+      });
+      __subtitleSetStatus('Test…');
+      const data = await __osSearchSubtitles('inception', 'fr,en', null);
+      const extra = data && data.__osMessage ? (' (' + data.__osMessage + ')') : '';
+      __subtitleSetStatus('OK: ' + (data.total_count || 0) + ' résultat(s)' + extra);
+    } catch (e) {
+      __subtitleSetStatus('Test KO: ' + (e && e.message ? e.message : String(e)));
+    }
+  });
+
+  clearTokBtn.addEventListener('click', () => {
+    __osClearToken();
+    __subtitleSetStatus('Token effacé.');
+  });
+}
 
 // Track elements ajoutés dynamiquement (pour pouvoir les nettoyer)
 const __externalSubtitleTrackEls = [];
@@ -4391,6 +4770,7 @@ function __subtitleSetStatus(msg) {
 }
 
 function __subtitleOpenOverlay(prefillTitle = '') {
+  try { __osEnsureSettingsUi(); } catch {}
   if (!subtitleSearchOverlay) return;
   try { subtitleSearchOverlay.classList.remove('hidden'); subtitleSearchOverlay.setAttribute('aria-hidden','false'); } catch {}
   if (subtitleSearchResults) subtitleSearchResults.innerHTML = '';
@@ -4564,38 +4944,24 @@ async function __subtitleHandleLocalFile(file) {
   __subtitleAddTrackFromVttText(vtt, label, 'und');
 }
 
-async function __subtitleProxySearchOpenSubtitles(query, languages, entry) {
-  if (!SUBTITLE_PROXY_BASE) {
-    throw new Error("SUBTITLE_PROXY_BASE vide : configure l'URL de ton proxy.");
-  }
-  const u = new URL(SUBTITLE_PROXY_BASE.replace(/\/+$/,'') + '/search');
-  if (query) u.searchParams.set('query', query);
-  if (languages) u.searchParams.set('languages', languages);
-
-  // si on a tmdbId de ta playlist, on l'envoie (plus fiable qu'un titre court)
-  if (entry && entry.tmdbId) u.searchParams.set('tmdb_id', String(entry.tmdbId).trim());
-
-  const res = await fetch(u.toString(), { method: 'GET' });
-  if (!res.ok) throw new Error('Erreur proxy (' + res.status + ')');
-  return await res.json();
+async function __subtitleProxySearchOpenSubtitles(query, languagesCsv, entry) {
+  // Appel DIRECT OpenSubtitles (navigateur)
+  return await __osSearchSubtitles(query, languagesCsv, entry);
 }
 
 async function __subtitleProxyDownloadFileOpenSubtitles(fileId, format = 'srt') {
-  if (!SUBTITLE_PROXY_BASE) {
-    throw new Error("SUBTITLE_PROXY_BASE vide : configure l'URL de ton proxy.");
-  }
-  const u = new URL(SUBTITLE_PROXY_BASE.replace(/\/+$/,'') + '/download-file');
-  u.searchParams.set('file_id', String(fileId));
-  u.searchParams.set('sub_format', format);
-
-  const res = await fetch(u.toString(), { method: 'GET' });
-  if (!res.ok) throw new Error('Erreur téléchargement (' + res.status + ')');
-  return await res.text();
+  // Appel DIRECT OpenSubtitles (navigateur) + login si nécessaire
+  return await __osDownloadSubtitleFileText(fileId, format);
 }
 
 function __subtitleRenderResultsOpenSubtitles(data, languagesCsv) {
   if (!subtitleSearchResults) return;
   subtitleSearchResults.innerHTML = '';
+
+  if (data && data.__osMessage) {
+    // exemple: "User-Agent header is wrong..." => aide au debug
+    __subtitleSetStatus((subtitleSearchStatus?.textContent || '') + ' — ' + data.__osMessage);
+  }
 
   const items = (data && Array.isArray(data.data)) ? data.data : [];
   if (!items.length) {
