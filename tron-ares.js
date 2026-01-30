@@ -1,3 +1,47 @@
+
+  // ===== OpenSubtitles Api-Key (champ visible, auto-rempli et masqué) =====
+  const __OS_API_KEY_LS = 'tron_os_api_key';
+  // ✅ Clé par défaut (persiste même si cookies/données effacés)
+  // Mets ta clé ici :
+  const __OS_DEFAULT_API_KEY = 'rVx2gnz00ySZGN20Q0XWvitki9wXhv36';
+  function __osLoadApiKey() {
+    try { return localStorage.getItem(__OS_API_KEY_LS) || __OS_DEFAULT_API_KEY || '';
+    } catch { return __OS_DEFAULT_API_KEY || ''; }
+  }
+  function __osSaveApiKey(v) {
+    try { localStorage.setItem(__OS_API_KEY_LS, (v || '').trim()); } catch {}
+  }
+  function __osGetApiKey() {
+    const el = document.getElementById('subtitleSearchApiKeyInput');
+    const v = (el && el.value ? String(el.value) : '').trim();
+    return v || __osLoadApiKey();
+  }
+  function __osBindApiKeyField() {
+    const el = document.getElementById('subtitleSearchApiKeyInput');
+    if (!el) return false;
+
+    if (el.dataset && el.dataset.osBound === '1') return true;
+    if (el.dataset) el.dataset.osBound = '1';
+
+    // toujours masqué (points)
+    try { el.type = 'password'; } catch {}
+
+    const saved = __osLoadApiKey();
+    if (!el.value && saved) el.value = saved;
+
+    el.addEventListener('input', () => __osSaveApiKey(el.value));
+    return true;
+  }
+  function __osAutoBindApiKeyField() {
+    if (__osBindApiKeyField()) return;
+    const obs = new MutationObserver(() => {
+      if (__osBindApiKeyField()) obs.disconnect();
+    });
+    obs.observe(document.documentElement, { childList: true, subtree: true });
+  }
+  try { __osAutoBindApiKeyField(); } catch {}
+
+
 // =====================================================
 // TRON ARES IPTV PLAYER - JS CLEAN + RESUME + TRACKS
 // =====================================================
@@ -733,6 +777,7 @@ const subtitleSearchBtn = document.getElementById('subtitleSearchBtn');
 const subtitleSearchResults = document.getElementById('subtitleSearchResults');
 const subtitleSearchStatus = document.getElementById('subtitleSearchStatus');
 const subtitleSearchProviderSelect = document.getElementById('subtitleSearchProviderSelect');
+const subtitleSearchApiKeyInput = document.getElementById('subtitleSearchApiKeyInput');
 
 
 // --- Chromecast ---
@@ -4375,477 +4420,86 @@ document.addEventListener('click', () => closeAllTrackMenus());
 // =====================================================
 // SOUS-TITRES EXTERNES (import local + recherche en ligne)
 // =====================================================
-//
-// ✅ Mode DIRECT (sans proxy):
-// - On appelle OpenSubtitles depuis le navigateur.
-// - Ça évite le 403 "Varnish / Access denied" qui peut arriver quand les requêtes viennent d’un proxy (Worker).
-//
-// Pré-requis OpenSubtitles:
-// - Header "Api-Key" obligatoire
-// - "User-Agent" (et/ou "X-User-Agent") doit contenir une VERSION, ex: "TronAresSub v1.0.0"
-//
-// Recherche: OK sans login
-// Téléchargement SRT: nécessite login (username/password) pour obtenir un token.
-//
-// -----------------------------------------------------
 
-const OS_DEFAULTS = {
-  // Appel direct OpenSubtitles (depuis le navigateur) — peut être bloqué par CORS / rate-limit sur les préflights.
-  apiBase: 'https://api.opensubtitles.com/api/v1',
+// 1) IMPORTANT:
+// - GitHub Pages = site statique : tu ne peux pas appeler OpenSubtitles directement depuis le navigateur (CORS).
+// - Donc on passe par un petit proxy (Cloudflare Worker / Netlify Function) qui ajoute les headers et CORS.
+// Mets ici l'URL de ton proxy (ex: https://subproxy.example.workers.dev)
+const SUBTITLE_PROXY_BASE = 'https://subproxy-opensub2.victor-salema-53d.workers.dev'; // <- À REMPLIR
+// --- OpenSubtitles direct (sans login) ---
+// On stocke la clé dans le navigateur (localStorage) : pratique pour un usage "famille" sur un même PC.
+const OS_API_BASE = 'https://api.opensubtitles.com/api/v1';
+const OS_LS_API_KEY = 'tron_os_api_key';
+const OS_LS_USER_AGENT = 'tron_os_user_agent';
 
-  // Identifie ton application auprès d’OpenSubtitles (exige souvent une VERSION).
-  userAgent: 'TronAresSub v1.0.0',
+function __osGetApiKey() {
+  try { return (localStorage.getItem(OS_LS_API_KEY) || '').trim(); } catch { return ''; }
+}
+function __osSetApiKey(v) {
+  try { localStorage.setItem(OS_LS_API_KEY, String(v || '').trim()); } catch {}
+}
+function __osGetUserAgent() {
+  let ua = '';
+  try { ua = (localStorage.getItem(OS_LS_USER_AGENT) || '').trim(); } catch {}
+  if (!ua) ua = 'TronAresSub v1.0.0';
+  // OpenSubtitles veut un User-Agent avec version parseable (ex: "NomApp v1.2.3")
+  if (!/\bv\d+\.\d+\.\d+\b/i.test(ua)) ua = ua.replace(/\s+$/,'') + ' v1.0.0';
+  return ua;
+}
+function __osSetUserAgent(v) {
+  try { localStorage.setItem(OS_LS_USER_AGENT, String(v || '').trim()); } catch {}
+}
 
-  // Clé API OpenSubtitles (obligatoire)
-  apiKey: '',
+function __osEnsureApiKeyOrThrow() {
+  // Priorité au champ UI (si présent), sinon localStorage.
+  const fromUi = (subtitleSearchApiKeyInput?.value || '').trim();
+  const fromLs = __osGetApiKey();
 
-  // Login OpenSubtitles (uniquement nécessaire pour télécharger)
-  username: '',
-  password: '',
-
-  // Mode proxy (recommandé): ton serveur appelle OpenSubtitles à ta place (pas de CORS côté navigateur).
-  // Exemple: 'http://localhost:8787/os' ou 'https://ton-domaine.tld/os'
-  useProxy: false,
-  proxyBase: '',
-};
-
-const OS_STORAGE_KEY = 'tronAres.opensub.config.v1';
-const OS_TOKEN_KEY = 'tronAres.opensub.token.v1';
-
-function __osLoadConfig() {
-  try {
-    const raw = localStorage.getItem(OS_STORAGE_KEY);
-    if (!raw) return { ...OS_DEFAULTS };
-    const parsed = JSON.parse(raw);
-    return { ...OS_DEFAULTS, ...(parsed || {}) };
-  } catch {
-    return { ...OS_DEFAULTS };
+  const k = (fromUi || fromLs || '').trim();
+  if (!k) {
+    throw new Error("Api-Key manquante. Ouvre 💬 Sous-titres → Rechercher en ligne et colle ta clé dans le champ « Api-Key OpenSubtitles ».");
   }
+
+  // Si l'utilisateur vient de la coller dans le champ, on la persiste
+  if (fromUi && fromUi !== fromLs) __osSetApiKey(fromUi);
+
+  return k;
 }
 
-function __osSaveConfig(cfg) {
-  const safe = {
-    apiBase: (cfg.apiBase || OS_DEFAULTS.apiBase).trim(),
-    userAgent: (cfg.userAgent || OS_DEFAULTS.userAgent).trim(),
-    apiKey: (cfg.apiKey || '').trim(),
-    username: (cfg.username || '').trim(),
-    password: (cfg.password || ''),
-    useProxy: !!cfg.useProxy,
-    proxyBase: (cfg.proxyBase || '').trim(),
-  };
-  localStorage.setItem(OS_STORAGE_KEY, JSON.stringify(safe));
-  return safe;
-}
+async function __subtitleSearchOpenSubtitlesDirect(query, languages, entry) {
+  const apiKey = __osGetApiKey();
+  const ua = __osGetUserAgent();
 
-function __osLoadToken() {
-  try {
-    const raw = localStorage.getItem(OS_TOKEN_KEY);
-    if (!raw) return null;
-    const t = JSON.parse(raw);
-    if (!t || !t.token || !t.expMs) return null;
-    if (Date.now() >= Number(t.expMs)) return null;
-    return t;
-  } catch {
-    return null;
-  }
-}
+  const u = new URL(OS_API_BASE.replace(/\/+$/,'') + '/subtitles');
+  if (query) u.searchParams.set('query', query);
+  if (languages) u.searchParams.set('languages', languages);
 
-function __osSaveToken(token, ttlMs = 10 * 60_000) {
-  const t = { token, expMs: Date.now() + ttlMs };
-  localStorage.setItem(OS_TOKEN_KEY, JSON.stringify(t));
-  return t;
-}
+  // Si on a un tmdbId (de ta playlist), on tente de l’envoyer (quand supporté)
+  if (entry && entry.tmdbId) u.searchParams.set('tmdb_id', String(entry.tmdbId).trim());
 
-function __osClearToken() {
-  try { localStorage.removeItem(OS_TOKEN_KEY); } catch {}
-}
-
-let __osLoginInFlight = null;
-let __osLoginCooldownUntil = 0;
-
-function __osHeaders(cfg, extra = {}) {
-  const h = new Headers(extra || {});
-  h.set('Accept', 'application/json');
-
-  const apiKey = (cfg.apiKey || '').trim();
-  if (apiKey) h.set('Api-Key', apiKey);
-
-  const ua = (cfg.userAgent || OS_DEFAULTS.userAgent).trim();
-  if (ua) {
-    // 'User-Agent' est un header interdit côté navigateur; on utilise uniquement X-User-Agent.
-    h.set('X-User-Agent', ua);
-  }
-  return h;
-}
-
-async function __osFetch(cfg, path, init = {}, requireAuth = false) {
-  const base = (cfg.apiBase || OS_DEFAULTS.apiBase).replace(/\/+$/, '');
-  const url = base + (path.startsWith('/') ? path : ('/' + path));
-
-  const headers = __osHeaders(cfg, init.headers || {});
-  const reqInit = { ...init, headers };
-
-  // Auth: ajoute Bearer token, et retente 1 fois si token expiré (401)
-  if (requireAuth) {
-    let tok = __osLoadToken();
-    if (!tok || !tok.token) {
-      const token = await __osLogin(cfg);
-      tok = { token };
+  const res = await fetch(u.toString(), {
+    method: 'GET',
+    headers: {
+      'Api-Key': apiKey,
+      'User-Agent': ua,
+      'X-User-Agent': ua,
+      'Accept': 'application/json'
     }
-    headers.set('Authorization', `Bearer ${tok.token}`);
-  }
-
-  let res = await fetch(url, reqInit);
-
-  if (requireAuth && res && res.status === 401) {
-    // Token probablement expiré: on purge et on relogin (une seule fois)
-    __osClearToken();
-    const token = await __osLogin(cfg);
-    headers.set('Authorization', `Bearer ${token}`);
-    res = await fetch(url, reqInit);
-  }
-
-  return res;
-}
-
-async function __osLogin(cfg) {
-  const username = (cfg.username || '').trim();
-  const password = (cfg.password || '');
-  if (!username || !password) {
-    throw new Error('Login requis pour télécharger. Renseigne username/password dans les réglages (⚙).');
-  }
-
-  // Si on a déjà un token valide, on l'utilise.
-  const existing = __osLoadToken();
-  if (existing && existing.token) return existing.token;
-
-  // Anti-spam: si un login est déjà en cours, on attend le même.
-  if (__osLoginInFlight) return __osLoginInFlight;
-
-  const doLogin = async () => {
-    // Cooldown si on a pris un 429 juste avant
-    const now = Date.now();
-    if (now < __osLoginCooldownUntil) {
-      await new Promise(r => setTimeout(r, __osLoginCooldownUntil - now));
-    }
-
-    // Re-check (au cas où un autre login vient de remplir le token)
-    const again = __osLoadToken();
-    if (again && again.token) return again.token;
-
-    // 2 tentatives max (si 429, on attend ~1s puis on retente)
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const res = await __osFetch(cfg, '/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password }),
-      }, false);
-
-      const txt = await res.text().catch(() => '');
-      let json = null;
-      try { json = JSON.parse(txt); } catch {}
-
-      if (res.ok && json && json.token) {
-        // Garde le token 1 heure pour éviter de relogin trop souvent
-        __osSaveToken(String(json.token), 60 * 60_000);
-        return String(json.token);
-      }
-
-      if (res.status === 429) {
-        // OpenSubtitles: 1 req/sec par IP sur /login
-        __osLoginCooldownUntil = Date.now() + 1100;
-        if (attempt === 0) continue;
-        throw new Error('Échec login OpenSubtitles (429): Login rate limit exceeded: 1 req/sec per IP. Attends 1 seconde puis réessaie.');
-      }
-
-      const msg = (json && (json.message || json.error)) ? (json.message || json.error) : txt;
-      throw new Error('Échec login OpenSubtitles (' + res.status + '): ' + (msg || ''));
-    }
-
-    throw new Error('Échec login OpenSubtitles: impossible de se connecter.');
-  };
-
-  __osLoginInFlight = doLogin().finally(() => { __osLoginInFlight = null; });
-  return __osLoginInFlight;
-}
-async function __osSearchSubtitles(query, languages, entry) {
-  const cfg = __osLoadConfig();
-  if (!cfg.apiKey) throw new Error('Api-Key manquante. Ouvre les réglages (⚙).');
-
-  const params = new URLSearchParams();
-  if (query) params.set('query', query);
-  if (languages) params.set('languages', languages);
-  params.set('page', '1');
-
-  if (entry && entry.tmdbId) params.set('tmdb_id', String(entry.tmdbId).trim());
-
-  const res = await __osFetch(cfg, '/subtitles?' + params.toString(), { method: 'GET' }, false);
-
-  const txt = await res.text().catch(() => '');
-  let json;
-  try { json = JSON.parse(txt); } catch { json = { raw: txt }; }
-
-  const osMsg = res.headers.get('X-OpenSubtitles-Message');
-  if (osMsg) json.__osMessage = osMsg;
+  });
 
   if (!res.ok) {
-    // WAF HTML -> message clair
-    const ct = (res.headers.get('content-type') || '').toLowerCase();
-    if (ct.includes('text/html')) {
-      throw new Error('OpenSubtitles a refusé la requête (' + res.status + '). Si tu vois "Access denied / Varnish", c’est un blocage anti-proxy.');
+    const txt = await res.text().catch(() => '');
+    if (res.status === 429) {
+      throw new Error("OpenSubtitles limite tes requêtes (429). Attends 2–5 secondes et réessaie. Détail: " + (txt || ''));
     }
-    const msg = (json && (json.message || json.error)) ? (json.message || json.error) : (json.raw || '');
-    throw new Error('OpenSubtitles search (' + res.status + '): ' + (msg || ''));
+    if (res.status === 503) {
+      throw new Error("OpenSubtitles est temporairement indisponible (503). Réessaie dans quelques minutes.");
+    }
+    throw new Error('OpenSubtitles erreur (' + res.status + '): ' + (txt || ''));
   }
-
-  return json;
+  return await res.json();
 }
 
-async function __osDownloadSubtitleFileText(fileId, subFormat = 'srt') {
-  const cfg = __osLoadConfig();
-  if (!cfg.apiKey) throw new Error('Api-Key manquante. Ouvre les réglages (⚙).');
-
-  // 1) demander un lien de téléchargement
-  const res = await __osFetch(cfg, '/download', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ file_id: Number(fileId), sub_format: subFormat }),
-  }, true);
-
-  const txt = await res.text().catch(() => '');
-  let json;
-  try { json = JSON.parse(txt); } catch { json = null; }
-
-  if (!res.ok || !json || !json.link) {
-    const ct = (res.headers.get('content-type') || '').toLowerCase();
-    if (ct.includes('text/html')) {
-      throw new Error('OpenSubtitles a refusé la requête (' + res.status + '). Si tu vois "Access denied / Varnish", c’est un blocage anti-proxy.');
-    }
-    const msg = (json && (json.message || json.error)) ? (json.message || json.error) : txt;
-    throw new Error('OpenSubtitles download (' + res.status + '): ' + (msg || ''));
-  }
-
-  // 2) télécharger le fichier via le lien
-  const fileRes = await fetch(String(json.link), { method: 'GET' });
-  if (!fileRes.ok) throw new Error('Téléchargement fichier (' + fileRes.status + ')');
-  return await fileRes.text();
-}
-
-// -----------------------------------------------------
-// UI Réglages OpenSubtitles (injectée dans le popup)
-// -----------------------------------------------------
-
-let __osSettingsUiBuilt = false;
-
-function __osEnsureSettingsUi() {
-  if (__osSettingsUiBuilt) return;
-  __osSettingsUiBuilt = true;
-
-  if (!subtitleSearchOverlay || !subtitleSearchOverlay.querySelector) return;
-
-  const actions = subtitleSearchOverlay.querySelector('.subsearch-actions');
-  if (!actions) return;
-
-  const gear = document.createElement('button');
-  gear.type = 'button';
-  gear.className = 'subsearch-mini-btn';
-  gear.textContent = '⚙';
-  gear.title = 'Réglages OpenSubtitles';
-  actions.appendChild(gear);
-
-  const modal = document.createElement('div');
-  modal.style.position = 'fixed';
-  modal.style.inset = '0';
-  modal.style.background = 'rgba(0,0,0,0.55)';
-  modal.style.display = 'none';
-  modal.style.zIndex = '99999';
-
-  const box = document.createElement('div');
-  box.style.maxWidth = '620px';
-  box.style.margin = '7vh auto';
-  box.style.background = '#0b0f14';
-  box.style.border = '1px solid rgba(255,255,255,0.12)';
-  box.style.borderRadius = '14px';
-  box.style.padding = '18px';
-  box.style.boxShadow = '0 20px 60px rgba(0,0,0,0.45)';
-
-  const title = document.createElement('div');
-  title.style.display = 'flex';
-  title.style.alignItems = 'center';
-  title.style.justifyContent = 'space-between';
-  title.style.gap = '10px';
-
-  const h = document.createElement('div');
-  h.textContent = 'Réglages OpenSubtitles';
-  h.style.fontWeight = '700';
-  h.style.fontSize = '18px';
-
-  const close = document.createElement('button');
-  close.type = 'button';
-  close.className = 'subsearch-mini-btn';
-  close.textContent = '✕';
-
-  title.appendChild(h);
-  title.appendChild(close);
-
-  const form = document.createElement('div');
-  form.style.display = 'grid';
-  form.style.gridTemplateColumns = '1fr';
-  form.style.gap = '10px';
-  form.style.marginTop = '12px';
-
-  function field(labelText, placeholder, type = 'text') {
-    const wrap = document.createElement('div');
-
-    const lab = document.createElement('div');
-    lab.textContent = labelText;
-    lab.style.fontSize = '13px';
-    lab.style.opacity = '0.85';
-    lab.style.marginBottom = '6px';
-
-    const inp = document.createElement('input');
-    inp.type = type;
-    inp.placeholder = placeholder || '';
-    inp.style.width = '100%';
-    inp.style.padding = '10px 12px';
-    inp.style.borderRadius = '10px';
-    inp.style.border = '1px solid rgba(255,255,255,0.14)';
-    inp.style.background = 'rgba(255,255,255,0.06)';
-    inp.style.color = 'white';
-    inp.autocomplete = 'off';
-    inp.spellcheck = false;
-
-    wrap.appendChild(lab);
-    wrap.appendChild(inp);
-    return { wrap, inp };
-  }
-
-  const cfg = __osLoadConfig();
-
-  const fApiKey = field('Api-Key (obligatoire)', "colle ta clé OpenSubtitles", 'text');
-  const fUa = field('X-User-Agent (avec version)', 'ex: TronAresSub v1.0.0', 'text');
-  const fUser = field('Username', 'ton login / email', 'text');
-  const fPass = field('Password', 'ton mot de passe', 'password');
-
-  // Proxy backend (recommandé pour éviter les erreurs CORS dans le navigateur)
-  const proxyRow = document.createElement('div');
-  proxyRow.style.display = 'flex';
-  proxyRow.style.alignItems = 'center';
-  proxyRow.style.gap = '10px';
-  proxyRow.style.flexWrap = 'wrap';
-
-  const proxyChk = document.createElement('input');
-  proxyChk.type = 'checkbox';
-  proxyChk.id = 'os-use-proxy';
-  proxyChk.style.transform = 'scale(1.1)';
-
-  const proxyLab = document.createElement('label');
-  proxyLab.htmlFor = proxyChk.id;
-  proxyLab.textContent = 'Utiliser un proxy backend (évite CORS)';
-
-  proxyRow.append(proxyChk, proxyLab);
-
-  const fProxyBase = field('URL base du proxy', "ex: http://localhost:8787/os", 'text');
-
-fApiKey.inp.value = cfg.apiKey || '';
-  fUa.inp.value = cfg.userAgent || OS_DEFAULTS.userAgent;
-  fUser.inp.value = cfg.username || '';
-  fPass.inp.value = cfg.password || '';
-
-  proxyChk.checked = !!cfg.useProxy;
-  fProxyBase.inp.value = cfg.proxyBase || '';
-const foot = document.createElement('div');
-  foot.style.marginTop = '10px';
-  foot.style.display = 'flex';
-  foot.style.gap = '10px';
-  foot.style.flexWrap = 'wrap';
-  foot.style.alignItems = 'center';
-
-  const saveBtn = document.createElement('button');
-  saveBtn.type = 'button';
-  saveBtn.className = 'subsearch-mini-btn';
-  saveBtn.textContent = 'Enregistrer';
-
-  const testBtn = document.createElement('button');
-  testBtn.type = 'button';
-  testBtn.className = 'subsearch-mini-btn';
-  testBtn.textContent = 'Tester recherche';
-
-  const clearTokBtn = document.createElement('button');
-  clearTokBtn.type = 'button';
-  clearTokBtn.className = 'subsearch-mini-btn';
-  clearTokBtn.textContent = 'Effacer token';
-
-  const hint = document.createElement('div');
-  hint.style.fontSize = '12px';
-  hint.style.opacity = '0.8';
-  hint.style.marginTop = '8px';
-  hint.textContent = 'Recherche sans login. Login requis seulement pour télécharger. Si tu as des erreurs CORS/429, active le proxy backend.';
-
-  foot.appendChild(saveBtn);
-  foot.appendChild(testBtn);
-  foot.appendChild(clearTokBtn);
-
-  form.appendChild(fApiKey.wrap);
-  form.appendChild(fUa.wrap);
-  form.appendChild(fUser.wrap);
-  form.appendChild(fPass.wrap);
-  form.appendChild(proxyRow);
-  form.appendChild(fProxyBase.wrap);
-  form.appendChild(foot);
-  form.appendChild(hint);
-
-  box.appendChild(title);
-  box.appendChild(form);
-  modal.appendChild(box);
-  document.body.appendChild(modal);
-
-  function open() { modal.style.display = 'block'; }
-  function closeIt() { modal.style.display = 'none'; }
-
-  close.addEventListener('click', closeIt);
-  modal.addEventListener('click', (e) => { if (e.target === modal) closeIt(); });
-  gear.addEventListener('click', open);
-
-  saveBtn.addEventListener('click', () => {
-    const next = __osSaveConfig({
-      apiBase: OS_DEFAULTS.apiBase,
-      apiKey: fApiKey.inp.value,
-      userAgent: fUa.inp.value,
-      username: fUser.inp.value,
-      password: fPass.inp.value,
-      useProxy: proxyChk.checked,
-      proxyBase: fProxyBase.inp.value,
-    });
-    __subtitleSetStatus(next.apiKey ? 'Réglages enregistrés.' : 'Réglages enregistrés (Api-Key manquante).');
-    closeIt();
-  });
-
-  testBtn.addEventListener('click', async () => {
-    try {
-      __osSaveConfig({
-        apiBase: OS_DEFAULTS.apiBase,
-        apiKey: fApiKey.inp.value,
-        userAgent: fUa.inp.value,
-        username: fUser.inp.value,
-        password: fPass.inp.value,
-        useProxy: proxyChk.checked,
-        proxyBase: fProxyBase.inp.value,
-      });
-      __subtitleSetStatus('Test…');
-      const data = await __subtitleProxySearchOpenSubtitles('inception', 'fr,en', null);
-      const extra = data && data.__osMessage ? (' (' + data.__osMessage + ')') : '';
-      __subtitleSetStatus('OK: ' + (data.total_count || 0) + ' résultat(s)' + extra);
-    } catch (e) {
-      __subtitleSetStatus('Test KO: ' + (e && e.message ? e.message : String(e)));
-    }
-  });
-
-  clearTokBtn.addEventListener('click', () => {
-    __osClearToken();
-    __subtitleSetStatus('Token effacé.');
-  });
-}
 
 // Track elements ajoutés dynamiquement (pour pouvoir les nettoyer)
 const __externalSubtitleTrackEls = [];
@@ -4856,11 +4510,11 @@ function __subtitleSetStatus(msg) {
 }
 
 function __subtitleOpenOverlay(prefillTitle = '') {
-  try { __osEnsureSettingsUi(); } catch {}
   if (!subtitleSearchOverlay) return;
   try { subtitleSearchOverlay.classList.remove('hidden'); subtitleSearchOverlay.setAttribute('aria-hidden','false'); } catch {}
   if (subtitleSearchResults) subtitleSearchResults.innerHTML = '';
   __subtitleSetStatus('');
+  try { if (subtitleSearchApiKeyInput) subtitleSearchApiKeyInput.value = __osGetApiKey(); } catch {}
   if (subtitleSearchTitleInput) {
     subtitleSearchTitleInput.value = (prefillTitle || '').trim();
     try { subtitleSearchTitleInput.focus(); } catch {}
@@ -4870,6 +4524,22 @@ function __subtitleOpenOverlay(prefillTitle = '') {
 function __subtitleCloseOverlay() {
   if (!subtitleSearchOverlay) return;
   try { subtitleSearchOverlay.classList.add('hidden'); subtitleSearchOverlay.setAttribute('aria-hidden','true'); } catch {}
+}
+
+// Câblage du bouton "Rechercher" (dans l'overlay sous-titres)
+if (subtitleSearchBtn) {
+  subtitleSearchBtn.addEventListener('click', (ev) => {
+    ev.preventDefault();
+    __subtitleDoSearch();
+  });
+}
+if (subtitleSearchTitleInput) {
+  subtitleSearchTitleInput.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') {
+      ev.preventDefault();
+      __subtitleDoSearch();
+    }
+  });
 }
 
 function __subtitleGuessTitleFromEntry(entry) {
@@ -5030,79 +4700,38 @@ async function __subtitleHandleLocalFile(file) {
   __subtitleAddTrackFromVttText(vtt, label, 'und');
 }
 
-async function __osProxySearchSubtitles(query, languagesCsv, entry) {
-  const cfg = __osLoadConfig();
-  const base = (cfg.proxyBase || '').replace(/\/+$/, '');
-  if (!base) throw new Error('Proxy activé mais URL base vide. Ouvre les réglages (⚙).');
-
-  const params = new URLSearchParams();
-  if (query) params.set('query', query);
-  if (languagesCsv) params.set('languages', languagesCsv);
-  if (entry && entry.tmdbId) params.set('tmdb_id', String(entry.tmdbId).trim());
-  params.set('page', '1');
-
-  const url = base + '/subtitles?' + params.toString();
-  const res = await fetch(url, { method: 'GET', headers: { 'Accept': 'application/json' } });
-  const txt = await res.text().catch(() => '');
-  let json;
-  try { json = JSON.parse(txt); } catch { json = { raw: txt }; }
-
-  if (!res.ok) {
-    const msg = (json && (json.message || json.error)) ? (json.message || json.error) : (json.raw || txt || '');
-    throw new Error('Proxy OpenSubtitles search (' + res.status + '): ' + (msg || ''));
+async function __subtitleProxySearchOpenSubtitles(query, languages, entry) {
+  if (!SUBTITLE_PROXY_BASE) {
+    throw new Error("SUBTITLE_PROXY_BASE vide : configure l'URL de ton proxy.");
   }
-  return json;
-}
+  const u = new URL(SUBTITLE_PROXY_BASE.replace(/\/+$/,'') + '/search');
+  if (query) u.searchParams.set('query', query);
+  if (languages) u.searchParams.set('languages', languages);
 
-async function __osProxyDownloadSubtitleFileText(fileId, subFormat = 'srt') {
-  const cfg = __osLoadConfig();
-  const base = (cfg.proxyBase || '').replace(/\/+$/, '');
-  if (!base) throw new Error('Proxy activé mais URL base vide. Ouvre les réglages (⚙).');
+  // si on a tmdbId de ta playlist, on l'envoie (plus fiable qu'un titre court)
+  if (entry && entry.tmdbId) u.searchParams.set('tmdb_id', String(entry.tmdbId).trim());
 
-  const url = base + '/download';
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Accept': 'text/plain' },
-    body: JSON.stringify({ file_id: Number(fileId), sub_format: subFormat }),
-  });
-
-  const txt = await res.text().catch(() => '');
-  if (!res.ok) {
-    // Le proxy peut renvoyer JSON d’erreur
-    let json;
-    try { json = JSON.parse(txt); } catch { json = null; }
-    const msg = (json && (json.message || json.error)) ? (json.message || json.error) : (txt || '');
-    throw new Error('Proxy OpenSubtitles download (' + res.status + '): ' + (msg || ''));
-  }
-  return txt;
-}
-
-async function __subtitleProxySearchOpenSubtitles(query, languagesCsv, entry) {
-  const cfg = __osLoadConfig();
-  if (cfg.useProxy) {
-    return await __osProxySearchSubtitles(query, languagesCsv, entry);
-  }
-  // Appel DIRECT OpenSubtitles (navigateur)
-  return await __osSearchSubtitles(query, languagesCsv, entry);
+  const res = await fetch(u.toString(), { method: 'GET' });
+  if (!res.ok) throw new Error('Erreur proxy (' + res.status + ')');
+  return await res.json();
 }
 
 async function __subtitleProxyDownloadFileOpenSubtitles(fileId, format = 'srt') {
-  const cfg = __osLoadConfig();
-  if (cfg.useProxy) {
-    return await __osProxyDownloadSubtitleFileText(fileId, format);
+  if (!SUBTITLE_PROXY_BASE) {
+    throw new Error("SUBTITLE_PROXY_BASE vide : configure l'URL de ton proxy.");
   }
-  // Appel DIRECT OpenSubtitles (navigateur) + login si nécessaire
-  return await __osDownloadSubtitleFileText(fileId, format);
+  const u = new URL(SUBTITLE_PROXY_BASE.replace(/\/+$/,'') + '/download-file');
+  u.searchParams.set('file_id', String(fileId));
+  u.searchParams.set('sub_format', format);
+
+  const res = await fetch(u.toString(), { method: 'GET' });
+  if (!res.ok) throw new Error('Erreur téléchargement (' + res.status + ')');
+  return await res.text();
 }
 
 function __subtitleRenderResultsOpenSubtitles(data, languagesCsv) {
   if (!subtitleSearchResults) return;
   subtitleSearchResults.innerHTML = '';
-
-  if (data && data.__osMessage) {
-    // exemple: "User-Agent header is wrong..." => aide au debug
-    __subtitleSetStatus((subtitleSearchStatus?.textContent || '') + ' — ' + data.__osMessage);
-  }
 
   const items = (data && Array.isArray(data.data)) ? data.data : [];
   if (!items.length) {
@@ -5115,14 +4744,12 @@ function __subtitleRenderResultsOpenSubtitles(data, languagesCsv) {
   items.slice(0, 30).forEach((row) => {
     const attrs = row && row.attributes ? row.attributes : {};
     const feature = attrs.feature_details || {};
-    const lang = attrs.language || attrs.lang || (feature && feature.language) || '';
-    const release = attrs.release || attrs.release_name || '';
+    const lang = attrs.language || attrs.lang || '';
+    const release = attrs.release || '';
     const files = Array.isArray(attrs.files) ? attrs.files : [];
-    const file0 = files[0] || {};
-    const fileId = file0.file_id || file0.id || null;
-    const fileName = file0.file_name || attrs.file_name || 'subtitle.srt';
-
-    const title = (feature.title || feature.movie_name || '') || (attrs.subtitle_id ? ('Subtitle #' + attrs.subtitle_id) : 'Sous-titres');
+    const fileName = files[0] && files[0].file_name ? files[0].file_name : '';
+    const title = (feature && (feature.title || feature.movie_name)) ? (feature.title || feature.movie_name) : (attrs.slug || 'Sous-titre');
+    const pageUrl = attrs.url || '';
 
     const card = document.createElement('div');
     card.className = 'subsearch-item';
@@ -5131,6 +4758,7 @@ function __subtitleRenderResultsOpenSubtitles(data, languagesCsv) {
     top.className = 'subsearch-item-top';
 
     const left = document.createElement('div');
+    left.className = 'subsearch-item-left';
 
     const t = document.createElement('div');
     t.className = 'subsearch-item-title';
@@ -5143,63 +4771,33 @@ function __subtitleRenderResultsOpenSubtitles(data, languagesCsv) {
     if (release) metaParts.push('Release: ' + release);
     if (fileName) metaParts.push('Fichier: ' + fileName);
     if (attrs.download_count != null) metaParts.push('DL: ' + attrs.download_count);
-    left.append(t, meta);
     meta.textContent = metaParts.join(' • ');
+
+    left.append(t, meta);
 
     const actions = document.createElement('div');
     actions.className = 'subsearch-item-actions';
 
-    const applyBtn = document.createElement('button');
-    applyBtn.type = 'button';
-    applyBtn.className = 'subsearch-mini-btn';
-    applyBtn.textContent = 'Appliquer';
-    applyBtn.disabled = !fileId;
+    const openBtn = document.createElement('a');
+    openBtn.className = 'subsearch-mini-btn';
+    openBtn.textContent = 'Ouvrir sur OpenSubtitles';
+    openBtn.href = pageUrl || '#';
+    openBtn.target = '_blank';
+    openBtn.rel = 'noopener noreferrer';
+    if (!pageUrl) {
+      openBtn.style.opacity = '0.6';
+      openBtn.style.pointerEvents = 'none';
+      openBtn.title = "Lien indisponible sur ce résultat";
+    }
 
-    applyBtn.addEventListener('click', async () => {
-      if (!fileId) return;
-      try {
-        __subtitleSetStatus('Téléchargement…');
-        const srtText = await __subtitleProxyDownloadFileOpenSubtitles(fileId, 'srt');
-        const vtt = __subtitleSrtToVtt(srtText);
-        __subtitleAddTrackFromVttText(vtt, (lang ? ('OS ' + lang) : 'OpenSubtitles'), (lang || 'und'));
-        __subtitleSetStatus('Sous-titres appliqués.');
-        __subtitleCloseOverlay();
-      } catch (e) {
-        console.error(e);
-        __subtitleSetStatus('Erreur: ' + (e && e.message ? e.message : String(e)));
-      }
-    });
+    const hint = document.createElement('div');
+    hint.className = 'subsearch-item-hint';
+    hint.textContent = "Télécharge sur le site, puis utilise le bouton Importer .srt/.vtt pour l'appliquer.";
 
-    const dlBtn = document.createElement('button');
-    dlBtn.type = 'button';
-    dlBtn.className = 'subsearch-mini-btn';
-    dlBtn.textContent = 'Télécharger';
-    dlBtn.disabled = !fileId;
+    actions.append(openBtn);
 
-    dlBtn.addEventListener('click', async () => {
-      if (!fileId) return;
-      try {
-        __subtitleSetStatus('Téléchargement…');
-        const srtText = await __subtitleProxyDownloadFileOpenSubtitles(fileId, 'srt');
-        const blob = new Blob([srtText], { type: 'application/x-subrip;charset=utf-8' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = fileName || ('subtitle-' + fileId + '.srt');
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        setTimeout(() => { try { URL.revokeObjectURL(url); } catch {} }, 1500);
-        __subtitleSetStatus('Téléchargement lancé.');
-      } catch (e) {
-        console.error(e);
-        __subtitleSetStatus('Erreur: ' + (e && e.message ? e.message : String(e)));
-      }
-    });
-
-    actions.append(applyBtn, dlBtn);
     top.append(left);
-    card.append(top, actions);
+    card.append(top, actions, hint);
     subtitleSearchResults.appendChild(card);
   });
 }
@@ -5218,8 +4816,9 @@ async function __subtitleDoSearch() {
     __subtitleSetStatus('Recherche…');
     if (subtitleSearchResults) subtitleSearchResults.innerHTML = '';
 
+    // On garde le select "provider" pour compat, mais on utilise OpenSubtitles direct (sans login)
     if (provider === 'opensubtitles') {
-      const data = await __subtitleProxySearchOpenSubtitles(q, langs, currentEntry);
+      const data = await __subtitleSearchOpenSubtitlesDirect(q, langs, currentEntry);
       __subtitleRenderResultsOpenSubtitles(data, langs);
     } else {
       __subtitleSetStatus('Provider non supporté pour le moment.');
@@ -5234,6 +4833,16 @@ async function __subtitleDoSearch() {
 (function __bindSubtitleUiOnce(){
   if (window.__tronSubUiBound) return;
   window.__tronSubUiBound = true;
+
+// Api-Key (OpenSubtitles) : on la charge du localStorage dans le champ, puis on sauvegarde à chaque saisie.
+try {
+  if (subtitleSearchApiKeyInput) {
+    subtitleSearchApiKeyInput.value = __osGetApiKey();
+    subtitleSearchApiKeyInput.addEventListener('input', () => {
+      __osSetApiKey(subtitleSearchApiKeyInput.value);
+    });
+  }
+} catch {}
 
   subtitleSearchCloseBtn?.addEventListener('click', __subtitleCloseOverlay);
   subtitleSearchOverlay?.addEventListener('click', (e) => {
